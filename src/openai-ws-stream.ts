@@ -8,12 +8,16 @@
 import { randomUUID } from "node:crypto";
 import {
   calculateCost,
+  getCurrentSystemPrompt,
+  getCurrentTools,
   createAssistantMessageEventStream,
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
-  type Context,
+  type TranscriptContext as Context,
+  type Tool,
   type Message,
+  type JsonObject,
   type Model,
   type SimpleStreamOptions,
   type StopReason,
@@ -25,6 +29,7 @@ import {
 import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai/compat";
 import { loadConfig } from "./config.ts";
 import {
+  applyRemoteHistoryPayloadPatch,
   isDirectOpenAIResponsesModel,
   modelKey,
   thinkingLevelToResponsesReasoning,
@@ -372,7 +377,7 @@ function parseThinkingSignature(value: unknown): Extract<InputItem, { type: "rea
   }
 }
 
-function convertTools(tools: Context["tools"]): FunctionToolDefinition[] {
+function convertTools(tools: Tool[]): FunctionToolDefinition[] {
   if (!tools || tools.length === 0) return [];
   return tools.map((tool) => ({
     type: "function",
@@ -531,7 +536,7 @@ function buildAssistantMessageFromResponse(
         name: toolName,
         arguments: (() => {
           try {
-            return JSON.parse(item.arguments) as Record<string, unknown>;
+            return JSON.parse(item.arguments) as JsonObject;
           } catch {
             return {};
           }
@@ -587,7 +592,7 @@ function buildWsRequestKey(params: {
 }): string {
   return JSON.stringify({
     model: params.model.id,
-    instructions: params.context.systemPrompt ?? undefined,
+    instructions: getCurrentSystemPrompt(params.context.messages) || undefined,
     tools: params.tools.length > 0 ? params.tools : undefined,
     temperature: params.options?.temperature,
     max_output_tokens: params.options?.maxTokens,
@@ -641,7 +646,7 @@ function buildResponseCreatePayload(params: {
     model: params.model.id,
     store: false,
     input: params.inputItems,
-    instructions: params.context.systemPrompt ?? undefined,
+    instructions: getCurrentSystemPrompt(params.context.messages) || undefined,
     tools: params.tools.length > 0 ? params.tools : undefined,
     ...(params.previousResponseId ? { previous_response_id: params.previousResponseId } : {}),
     ...(params.options?.temperature !== undefined ? { temperature: params.options.temperature } : {}),
@@ -727,8 +732,10 @@ async function fallbackToHttp(
   signal?: AbortSignal,
 ): Promise<void> {
   const sessionId = options?.sessionId;
-  const remoteCompactionState = sessionId ? getRemoteCompactionState(sessionId) : undefined;
-  const continuationState = sessionId ? getContinuationState(sessionId) : undefined;
+  const cfg = loadConfig(process.cwd());
+  const canPatch = cfg.enabled && isDirectOpenAIResponsesModel(model);
+  const remoteCompactionState = canPatch && sessionId ? getRemoteCompactionState(sessionId) : undefined;
+  const continuationState = canPatch && cfg.usePreviousResponseId && sessionId ? getContinuationState(sessionId) : undefined;
   const originalOnPayload = options?.onPayload;
   const mergedOptions = {
     ...(signal ? { ...options, signal } : options),
@@ -737,9 +744,10 @@ async function fallbackToHttp(
       if (payload && typeof payload === "object") {
         const payloadObj = { ...(payload as Record<string, unknown>) };
         if (remoteCompactionState && remoteCompactionState.modelKey === modelKey(model)) {
-          payloadObj.input = normalizeResponseItemsForPrompt(remoteCompactionState.explicitHistory, model) as unknown[];
-          delete payloadObj.previous_response_id;
-          nextPayload = payloadObj;
+          nextPayload = applyRemoteHistoryPayloadPatch({
+            payload: payloadObj,
+            explicitHistory: normalizeResponseItemsForPrompt(remoteCompactionState.explicitHistory, model),
+          });
         } else if (
           typeof payloadObj.previous_response_id === "string" &&
           continuationState?.modelKey === modelKey(model) &&
@@ -847,8 +855,8 @@ export function createOpenAIWebSocketStreamFn(
             await runWarmUp({
               manager: session.manager,
               modelId: model.id,
-              tools: convertTools(context.tools),
-              instructions: context.systemPrompt ?? undefined,
+              tools: convertTools(getCurrentTools(context.messages)),
+              instructions: getCurrentSystemPrompt(context.messages) || undefined,
               signal,
             });
           } catch {
@@ -859,7 +867,7 @@ export function createOpenAIWebSocketStreamFn(
         const remoteCompactionState = getRemoteCompactionState(sessionId);
         const continuationState = getContinuationState(sessionId);
         const typedOptions = options as WsOptions | undefined;
-        const functionTools = convertTools(context.tools);
+        const functionTools = convertTools(getCurrentTools(context.messages));
         const requestKey = buildWsRequestKey({
           model,
           context,

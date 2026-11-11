@@ -3,6 +3,16 @@
 This changelog intentionally starts at **0.1.0**.
 
 ## Unreleased
+- add explicit `remoteCompactionProviders` opt-in for custom OpenAI Responses providers such as `local`
+- keep custom providers on Pi's built-in transport while enabling server-side compaction and compatible opaque-history replay
+- target Pi 1.5.0 and add offline local-provider regressions, including real Pi RPC persistence and lifecycle checks
+- retain the upstream OpenAI/Codex transport features and portable summary fallback
+- preserve Pi 1.5 prompt patches and extension-authored context during replay; honor context edits and reject failed assistant fragments
+- use portable context after cross-model dialogue so another model's progress is not silently dropped
+- reject empty/truncated portable summaries instead of saving an opaque-only checkpoint
+- record the local proxy's live exact-recall failures separately from successful protocol/lifecycle checks
+
+### Upstream unreleased changes
 - target Pi 0.80.9 and the `@earendil-works/*` package namespace
 - align compaction fallback, Responses payload normalization, Codex identity headers, and WebSocket behavior with Pi 0.80.9
 - replace the legacy `/responses/compact` call with Codex's current Responses compaction v2 protocol

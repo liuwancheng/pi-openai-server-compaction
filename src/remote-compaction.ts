@@ -17,16 +17,19 @@ import {
   compact,
   convertToLlm,
   serializeConversation,
+  sessionEntryToContextMessages,
   type CompactionResult,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { calculateCost, type Model, type Usage } from "@earendil-works/pi-ai";
-import { complete } from "@earendil-works/pi-ai/compat";
-import { isRecord } from "./config.ts";
+import { calculateCost, type Model, type ProviderHeaders, type Usage } from "@earendil-works/pi-ai";
+import { complete, streamSimple } from "@earendil-works/pi-ai/compat";
+import { isRecord, type ExtensionConfig } from "./config.ts";
 import {
   hostnameFromBaseUrl,
   isDirectOpenAIResponsesModel,
   isOpenAICodexResponsesModel,
   supportsRemoteCompactionModel,
+  messageMatchesModel,
   modelKey,
 } from "./openai.ts";
 
@@ -114,7 +117,8 @@ function normalizeBaseUrl(baseUrl: string | undefined, fallback: string): string
 function resolveDirectOpenAIResponsesEndpoint(model: Model<any>): string {
   const baseUrl = normalizeBaseUrl(typeof model.baseUrl === "string" ? model.baseUrl : undefined, "https://api.openai.com/v1");
   if (baseUrl.endsWith("/responses")) return baseUrl;
-  return baseUrl.endsWith("/v1") ? `${baseUrl}/responses` : `${baseUrl}/v1/responses`;
+  // Match Pi/OpenAI's baseURL semantics: append /responses without inventing /v1.
+  return `${baseUrl}/responses`;
 }
 
 function resolveCodexResponsesEndpoint(model: Model<any>): string {
@@ -125,7 +129,7 @@ function resolveCodexResponsesEndpoint(model: Model<any>): string {
 }
 
 export function remoteCompactionV2EndpointUrl(model: Model<any>): string {
-  if (isDirectOpenAIResponsesModel(model)) {
+  if (model.api === "openai-responses") {
     return resolveDirectOpenAIResponsesEndpoint(model);
   }
   if (isOpenAICodexResponsesModel(model)) {
@@ -216,25 +220,32 @@ function withRemoteCompactionV2Feature(headers: Record<string, string>): Record<
 
 export function buildRemoteCompactionHeaders(params: {
   model: Model<any>;
-  apiKey: string;
-  headers?: Record<string, string>;
+  apiKey?: string;
+  headers?: ProviderHeaders;
   sessionId?: string;
 }): Record<string, string> {
-  const codexIdentityHeaders = buildCodexIdentityHeaders(params.sessionId);
-  const commonHeaders = withRemoteCompactionV2Feature({
-    authorization: `Bearer ${params.apiKey}`,
-    ...codexIdentityHeaders,
-    ...(params.headers ?? {}),
+  const official = isDirectOpenAIResponsesModel(params.model) || isOpenAICodexResponsesModel(params.model);
+  const common = new Headers({
+    ...(params.apiKey ? { authorization: `Bearer ${params.apiKey}` } : {}),
+    ...(official ? buildCodexIdentityHeaders(params.sessionId) : {}),
     accept: "text/event-stream",
     "content-type": "application/json",
   });
-  if (isDirectOpenAIResponsesModel(params.model)) {
+  // Header names are case-insensitive; null suppresses defaults, as in Pi 1.5.
+  for (const [name, value] of Object.entries({ ...params.model.headers, ...params.headers })) {
+    if (value === null) common.delete(name);
+    else common.set(name, value);
+  }
+  const commonHeaders = official
+    ? withRemoteCompactionV2Feature(Object.fromEntries(common.entries()))
+    : Object.fromEntries(common.entries());
+  if (params.model.api === "openai-responses") {
     return commonHeaders;
   }
   if (isOpenAICodexResponsesModel(params.model)) {
     return {
       ...commonHeaders,
-      "chatgpt-account-id": extractCodexAccountId(params.apiKey),
+      "chatgpt-account-id": extractCodexAccountId(params.apiKey ?? ""),
       originator: "pi",
       "user-agent": `pi-openai-server-compaction (${platform()} ${release()}; ${arch()})`,
       "OpenAI-Beta": "responses=experimental",
@@ -367,6 +378,7 @@ export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
   }
 
   if (message.role === "assistant") {
+    if (message.stopReason === "error" || message.stopReason === "aborted") return [];
     let phase: AssistantPhase | undefined;
     const textBlocks: string[] = [];
 
@@ -379,13 +391,14 @@ export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
         ...(phase ? { phase } : {}),
       });
       textBlocks.length = 0;
+      phase = undefined;
     };
 
     for (const block of message.content) {
       if (block.type === "text") {
-        if (!phase) {
-          phase = parseTextSignaturePhase(block.textSignature);
-        }
+        const nextPhase = parseTextSignaturePhase(block.textSignature);
+        if (nextPhase !== phase) flushText();
+        phase = nextPhase;
         textBlocks.push(block.text);
         continue;
       }
@@ -422,8 +435,14 @@ export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
   return items;
 }
 
-export function messagesToResponseItems(messages: AgentMessage[]): ResponseItem[] {
-  return messages.flatMap((message) => messageToResponseItems(message));
+export function messagesToResponseItems(messages: AgentMessage[], targetModel?: Model<any>): ResponseItem[] {
+  return convertToLlm(messages).flatMap((message) => {
+    if (targetModel && message.role === "assistant" &&
+      (!messageMatchesModel(message, targetModel) || message.api !== targetModel.api)) {
+      return messageToResponseItems({ ...message, content: message.content.filter((block) => block.type !== "thinking") });
+    }
+    return messageToResponseItems(message);
+  });
 }
 
 function cloneResponseItem(item: ResponseItem): ResponseItem {
@@ -680,8 +699,9 @@ export function buildToolsPayload(
 export async function generatePortableSummary(params: {
   messages: AgentMessage[];
   model: Model<any>;
-  apiKey: string;
-  headers?: Record<string, string>;
+  apiKey?: string;
+  headers?: ProviderHeaders;
+  env?: Record<string, string>;
   customInstructions?: string;
   signal?: AbortSignal;
   firstKeptEntryId: string;
@@ -702,19 +722,26 @@ export async function generatePortableSummary(params: {
     {
       apiKey: params.apiKey,
       headers: params.headers,
+      env: params.env,
+      cacheRetention: "none",
+      sessionId: randomUUID(),
       maxTokens: 4096,
       signal: params.signal,
     },
   );
 
+  if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") {
+    throw new Error(response.errorMessage ?? `Portable summary failed (${response.stopReason})`);
+  }
   const summary = response.content
     .filter((item): item is { type: "text"; text: string } => item.type === "text")
     .map((item) => item.text)
     .join("\n")
     .trim();
+  if (!summary) throw new Error("Portable summary was empty");
 
   return {
-    summary: summary || buildCompactionSummaryText(params.model),
+    summary,
     firstKeptEntryId: params.firstKeptEntryId,
     tokensBefore: params.tokensBefore,
   };
@@ -724,8 +751,9 @@ export async function generateBestEffortLocalSummary(params: {
   preparation: CompactionPreparation;
   messages: AgentMessage[];
   model: Model<any>;
-  apiKey: string;
-  headers?: Record<string, string>;
+  apiKey?: string;
+  headers?: ProviderHeaders;
+  env?: Record<string, string>;
   customInstructions?: string;
   signal?: AbortSignal;
   thinkingLevel?: ThinkingLevel;
@@ -739,10 +767,26 @@ export async function generateBestEffortLocalSummary(params: {
       params.preparation,
       params.model,
       params.apiKey,
-      params.headers,
+      Object.fromEntries(Object.entries(params.headers ?? {}).filter((entry): entry is [string, string] => entry[1] !== null)),
       params.customInstructions,
       params.signal,
       params.thinkingLevel,
+      // compact's legacy headers type cannot express null; preserve suppression
+      // at the actual Pi 1.5 request boundary as well as in the portable summary.
+      (model, context, options) => {
+        const stream = streamSimple(model, context, { ...options, headers: params.headers });
+        const result = stream.result.bind(stream);
+        stream.result = async () => {
+          const response = await result();
+          const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("").trim();
+          if (response.stopReason === "aborted" || (!text && response.stopReason !== "error")) {
+            return { ...response, stopReason: "error", errorMessage: "Portable summary fallback was empty or aborted" };
+          }
+          return response;
+        };
+        return stream;
+      },
+      params.env,
     );
   }
 }
@@ -918,8 +962,9 @@ export function parseRemoteCompactionV2Events(events: unknown[]): RemoteCompacti
 
 export async function callRemoteCompactionEndpoint(params: {
   model: Model<any>;
-  apiKey: string;
-  headers?: Record<string, string>;
+  cfg?: Pick<ExtensionConfig, "remoteCompactionProviders">;
+  apiKey?: string;
+  headers?: ProviderHeaders;
   sessionId?: string;
   input: ResponseItem[];
   instructions?: string;
@@ -929,7 +974,7 @@ export async function callRemoteCompactionEndpoint(params: {
   text?: ResponsesTextConfig;
   signal?: AbortSignal;
 }): Promise<RemoteCompactionResult> {
-  if (!supportsRemoteCompactionModel(params.model)) {
+  if (!supportsRemoteCompactionModel(params.model, params.cfg)) {
     throw new Error("Remote compaction v2 is currently only enabled for supported OpenAI-compatible Responses models.");
   }
 
@@ -1012,7 +1057,8 @@ export function extractRemoteCompactionDetails(details: unknown):
 function parseModelKeyParts(
   value: string,
 ): { provider: string; api: string; id: string } | undefined {
-  const [provider, api, id] = value.split(":", 3);
+  const [provider, api, ...modelId] = value.split(":");
+  const id = modelId.join(":");
   if (!provider || !api || !id) return undefined;
   return { provider, api, id };
 }
@@ -1023,12 +1069,15 @@ function assistantMessageMatchesModelKey(
 ): boolean {
   const target = parseModelKeyParts(targetModelKey);
   if (!target) return false;
-  if (!isRecord(message)) return false;
+  if (message.role !== "assistant") return false;
   return message.provider === target.provider && message.model === target.id;
 }
 
 export function reconstructRemoteCompactionStateFromBranch(params: {
-  branchEntries: Array<{ type: string; id: string; details?: unknown; message?: AgentMessage }>;
+  branchEntries: Array<{
+    type: string; id: string; details?: unknown; message?: AgentMessage;
+    targetId?: string; replacement?: { content: unknown } | null;
+  }>;
 }): RemoteCompactionSessionState | undefined {
   let latestCompactionIndex = -1;
   let latestCompactionEntryId = "";
@@ -1043,18 +1092,33 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
 
   if (!latestDetails || latestCompactionIndex < 0) return undefined;
 
+  const edits = new Map<string, { content: unknown } | null>();
+  const compactedIds = new Set(params.branchEntries.slice(0, latestCompactionIndex).map((entry) => entry.id));
+  for (const entry of params.branchEntries.slice(latestCompactionIndex + 1)) {
+    if (entry.type !== "context_edit" || !entry.targetId || entry.replacement === undefined) continue;
+    // An opaque artifact cannot undo edits to its summarized prefix. Use Pi's text summary instead.
+    if (compactedIds.has(entry.targetId)) return undefined;
+    edits.set(entry.targetId, entry.replacement);
+  }
   const trailingMessages: ResponseItem[] = [];
   let pendingTurnItems: ResponseItem[] = [];
 
   for (const entry of params.branchEntries.slice(latestCompactionIndex + 1)) {
-    if (entry.type !== "message" || !entry.message) continue;
-
-    const items = messageToResponseItems(entry.message);
+    const edit = edits.get(entry.id);
+    if (edit === null) continue;
+    const messages = sessionEntryToContextMessages(entry as SessionEntry);
+    const items = messagesToResponseItems(edit
+      ? messages.map((message) => ({ ...message, content: edit.content }) as AgentMessage)
+      : messages);
     if (items.length === 0) continue;
 
-    if (entry.message.role === "assistant") {
+    if (entry.message?.role === "assistant") {
       if (assistantMessageMatchesModelKey(entry.message, latestDetails.modelKey)) {
         trailingMessages.push(...pendingTurnItems, ...items);
+      } else {
+        // Do not discard progress made by another model. The portable Pi
+        // projection retains that visible dialogue without foreign signatures.
+        return undefined;
       }
       pendingTurnItems = [];
       continue;
@@ -1067,7 +1131,7 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
     compactionEntryId: latestCompactionEntryId,
     modelKey: latestDetails.modelKey,
     replacementHistory: latestDetails.replacementHistory,
-    explicitHistory: [...latestDetails.replacementHistory, ...trailingMessages],
+    explicitHistory: [...latestDetails.replacementHistory, ...trailingMessages, ...pendingTurnItems],
   };
 }
 

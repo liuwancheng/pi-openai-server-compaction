@@ -1,5 +1,50 @@
 # pi-openai-server-compaction
 
+> **Fork:** [liuwancheng/pi-openai-server-compaction](https://github.com/liuwancheng/pi-openai-server-compaction), based on [algal/pi-openai-server-compaction](https://github.com/algal/pi-openai-server-compaction).
+> This fork adds explicit opt-in remote compaction for custom OpenAI Responses providers such as `local`, and targets Pi 1.5.0. Custom providers keep Pi's normal transport: no custom WebSocket, `store: true`, `context_management`, or `previous_response_id` is added by this extension.
+
+## Using a local Responses proxy
+
+Install from this fork (project-local first):
+
+```bash
+pi install -l git:github.com/liuwancheng/pi-openai-server-compaction
+```
+
+For every workspace, omit `-l` to install globally. The package installs into Pi, not into Pi Chat: restart the Pi Chat backend to replace already-running and prewarmed Pi processes.
+
+Add to `.pi/openai-server-compaction.json` in a trusted workspace, or `~/.pi/agent/openai-server-compaction.json` globally:
+
+```json
+{
+  "enabled": true,
+  "remoteCompactionProviders": ["local"]
+}
+```
+
+Only `openai-responses` models from explicitly listed providers are enabled. The default list is empty; naming a provider is not proof that all its models support compaction. The endpoint must accept `compaction_trigger`, return an opaque `compaction` item, and accept that item on later turns. Ordinary OpenAI-compatible chat support is not enough. Use only a proxy you trust: the compaction call sends conversation context, prompt, and tool definitions to the configured endpoint.
+
+For example, a model under `provider: local`, `api: openai-responses`, and `baseUrl: http://127.0.0.1:15721/v1` compacts through `http://127.0.0.1:15721/v1/responses`. Non-Responses models from the same provider keep Pi's normal compaction.
+
+The custom-provider path only adds remote compaction and compatible replay. Threshold and continuation options below still concern the upstream direct-OpenAI path, not the local proxy path. Cross-model turns continue to use the portable text-summary fallback.
+
+Pin a tested commit for repeatable installs:
+
+```bash
+pi install git:github.com/liuwancheng/pi-openai-server-compaction@<commit>
+```
+
+Rollback:
+
+```bash
+pi remove -l git:github.com/liuwancheng/pi-openai-server-compaction
+# Omit -l for a global install, then restart Pi / the Pi Chat backend.
+```
+
+Set `"enabled": false` to stop compaction and replay without uninstalling. Environment overrides have priority over file configuration.
+
+The sections below describe the upstream design and benchmark evidence; those benchmarks are not measurements of this fork or of a local proxy. See [fork validation and live fidelity caveats](VALIDATION.md#fork-validation-pi-150-and-a-local-responses-proxy) before enabling: protocol/lifecycle tests pass, but strict opaque-only exact recall on the tested local proxy was inconsistent.
+
 This is a Pi extension which adds **Codex-style remote compaction** for OpenAI models, giving you better continuity across compaction boundaries while preserving all of Pi's normal features.
 
 What does that mean? Why would you want it? My impression has been that Codex compacts better than Claude Code and better than Pi. And I supposed this was because Codex compacts by using OpenAI's server-side Responses compaction protocol. That protocol sends a `compaction_trigger` through `POST /v1/responses` and receives an encrypted `compaction` item. This extension configures Pi to use that protocol for OpenAI models alongside Pi's native compaction logic.
@@ -48,26 +93,27 @@ https://x.com/alexisgallagher/status/2042396986327060736?s=20 .)
 |-----------------------|-----------------------------|-----------------------------------|----------------------------------|-------------|
 | `openai/*`            | Yes                         | Yes                               | Yes                              | Yes         |
 | `openai-codex/*`      | Yes                         | No (built-in transport retained)  | No (built-in transport retained) | Yes         |
-| Azure                 | Partial (opt-in via config) | Partial                           | No                               | No          |
+| Custom `openai-responses` provider (explicit opt-in) | Yes | No | No (built-in transport retained) | See validation notes below |
+| Azure                 | Not enabled for remote compaction by the upstream predicate | Partial (opt-in) | No | No |
 
 ## Install
 
 Project-local (recommended):
 
 ```bash
-pi install -l git:github.com/algal/pi-openai-server-compaction
+pi install -l git:github.com/liuwancheng/pi-openai-server-compaction
 ```
 
 Global:
 
 ```bash
-pi install git:github.com/algal/pi-openai-server-compaction
+pi install git:github.com/liuwancheng/pi-openai-server-compaction
 ```
 
 One-shot, non-persistent:
 
 ```bash
-git clone https://github.com/algal/pi-openai-server-compaction.git
+git clone https://github.com/liuwancheng/pi-openai-server-compaction.git
 cd pi-openai-server-compaction && npm install
 pi -e ./src/index.ts --model openai/gpt-5.6-luna
 ```
@@ -75,7 +121,7 @@ pi -e ./src/index.ts --model openai/gpt-5.6-luna
 ## Requirements
 
 - Node `>= 22`
-- Pi `>=0.80.9 <0.81.0`
+- Pi `1.5.0` for this fork (the upstream release targeted `>=0.80.9 <0.81.0`)
 - Auth/config for the model you want to use must already work in Pi
 - A supported OpenAI Responses model, e.g. `openai/gpt-5.6-sol` or `openai-codex/gpt-5.6-sol`
 
@@ -109,7 +155,7 @@ The compaction request mirrors the shape of surrounding normal requests (reasoni
 
 The extension clears live continuation state on: session start/reload/resume, switch/fork, tree navigation, compaction completion, model selection, and shutdown.
 
-Remote compaction history is only replayed for compatible models. Cross-model turns are filtered from reconstructed replay history to prevent contamination after resume or tree navigation.
+Remote compaction history is only replayed for compatible models. After a completed turn on another model, replay falls back to Pi's portable context instead of discarding that model's visible progress. Failed/aborted assistant fragments are not replayed. Context edits to an opaque artifact's prefix also force portable fallback; tail edits are applied during reconstruction.
 
 ## Data handling
 
@@ -130,6 +176,7 @@ Config is read from:
 ```json
 {
   "enabled": true,
+  "remoteCompactionProviders": [],
   "includeAzure": false,
   "thresholdRatio": 0.7,
   "compactThreshold": 0,
@@ -142,6 +189,7 @@ Environment overrides:
 
 | Variable                                           | Effect                                                      |
 |----------------------------------------------------|-------------------------------------------------------------|
+| `PI_OPENAI_SERVER_COMPACTION_REMOTE_PROVIDERS`      | JSON array of explicitly enabled custom Responses providers, e.g. `["local"]` |
 | `PI_OPENAI_SERVER_COMPACTION_ENABLED`              | Enable/disable the extension                                |
 | `PI_OPENAI_SERVER_COMPACTION_AZURE`                | Include Azure OpenAI models                                 |
 | `PI_OPENAI_SERVER_COMPACTION_THRESHOLD`            | Explicit compact threshold (tokens)                         |
@@ -156,7 +204,7 @@ If something goes wrong:
 1. **Quick disable:** set `PI_OPENAI_SERVER_COMPACTION_ENABLED=0` or add `"enabled": false` to config
 2. **Bypass entirely:** run Pi with `--no-extensions`
 3. **Reload:** run `/reload` in Pi to re-initialize extensions
-4. **Uninstall:** `pi remove pi-openai-server-compaction`
+4. **Uninstall:** run `pi remove git:github.com/liuwancheng/pi-openai-server-compaction` (add `-l` for a project-local install)
 5. **Inspect:** check your session JSONL for `compaction` entries with `details.remoteCompaction` to see if remote compaction was recorded
 
 ## Testing
@@ -165,6 +213,7 @@ Smoke test (offline, verifies imports and key algorithms):
 
 ```bash
 npm run smoke
+npm run test:rpc  # Real Pi RPC with a synthetic local server; no external model calls
 ```
 
 Live end-to-end test (requires working Pi + OpenAI auth):

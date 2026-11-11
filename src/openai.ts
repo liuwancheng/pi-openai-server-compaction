@@ -86,9 +86,16 @@ export function supportsPreviousResponseId(
   return cfg.includeAzure && isAzureOpenAIResponsesModel(model);
 }
 
-export function supportsRemoteCompactionModel(model: unknown): model is ModelLike {
+export function supportsRemoteCompactionModel(
+  model: unknown,
+  cfg?: Pick<ExtensionConfig, "remoteCompactionProviders">,
+): model is ModelLike {
   if (!isOpenAIResponsesModel(model)) return false;
-  return isDirectOpenAIResponsesModel(model) || isOpenAICodexResponsesModel(model);
+  return isDirectOpenAIResponsesModel(model) || isOpenAICodexResponsesModel(model) || (
+    model.api === "openai-responses" &&
+    typeof model.provider === "string" &&
+    (cfg?.remoteCompactionProviders ?? []).includes(model.provider)
+  );
 }
 
 export function resolveCompactThreshold(
@@ -158,7 +165,14 @@ export function applyRemoteHistoryPayloadPatch(params: {
 }): JsonRecord {
   const nextPayload: JsonRecord = {
     ...params.payload,
-    input: params.explicitHistory,
+    // Pi 1.5 carries system prompt patches in Responses input messages.
+    // Preserve the current prompt when replacing conversation history.
+    input: [
+      ...(Array.isArray(params.payload.input)
+        ? params.payload.input.filter((item) => isRecord(item) && (item.role === "system" || item.role === "developer"))
+        : []),
+      ...params.explicitHistory,
+    ],
   };
   delete nextPayload.messages;
   delete nextPayload.previous_response_id;

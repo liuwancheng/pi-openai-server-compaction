@@ -17,6 +17,7 @@ export type ExtensionConfig = {
   thresholdRatio?: number;
   notify?: boolean;
   usePreviousResponseId?: boolean;
+  remoteCompactionProviders?: string[];
 };
 
 export function isRecord(value: unknown): value is JsonRecord {
@@ -52,6 +53,20 @@ function toPositiveNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function toProviderList(value: unknown): string[] | undefined {
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.trim())) {
+    return undefined;
+  }
+  return [...new Set(value.map((item: string) => item.trim()))];
+}
+
 export function loadConfig(cwd: string): Required<ExtensionConfig> {
   const globalPath = join(homedir(), ".pi", "agent", "openai-server-compaction.json");
   const projectPath = join(cwd, ".pi", "openai-server-compaction.json");
@@ -60,6 +75,12 @@ export function loadConfig(cwd: string): Required<ExtensionConfig> {
   const merged = { ...globalCfg, ...projectCfg };
 
   return {
+    // Same precedence as other options: environment > project > global > default.
+    // Arrays replace rather than merge; [] explicitly removes inherited providers.
+    remoteCompactionProviders:
+      toProviderList(process.env.PI_OPENAI_SERVER_COMPACTION_REMOTE_PROVIDERS) ??
+      toProviderList(merged.remoteCompactionProviders) ??
+      [],
     enabled:
       toBoolean(process.env.PI_OPENAI_SERVER_COMPACTION_ENABLED) ??
       toBoolean(merged.enabled) ??

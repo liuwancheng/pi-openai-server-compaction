@@ -1,6 +1,18 @@
 # Validation
 
-## Current Responses compaction v2 validation
+## Fork validation: Pi 1.5.0 and a local Responses proxy
+
+`npm test` passes type checking, offline algorithm/HTTP/WS tests, and a real Pi RPC suite against a synthetic local Responses server. The RPC suite covers persisted artifacts, repeated compaction, current prompt and system-prompt preservation, extension-authored messages, edited context, resume, model switching, clone/fork, disable, and remote-failure fallback. It does not use real credentials or call an external model.
+
+A real local proxy probe with `local/gpt-6.1-sol` accepted `compaction_trigger`, returned an opaque `compaction` item, and accepted artifact replay. A small direct protocol test recovered a fictional project code and date with only the artifact and a new question.
+
+**Live fidelity qualification:** two stricter Pi RPC tests generated a fictional codename in an assistant response, excluded it from the portable summary and visible retained user history, then asked for exact recall after compaction. Both completed normally but returned incorrect identifiers. A later resume probe also returned an incorrect identifier, while a direct HTTP call with the same captured payload recovered the original identifier. These observations do not establish the root cause and do not justify claiming reliable exact recall on this proxy. The small number of probes is not a benchmark.
+
+Consequently, protocol and lifecycle compatibility are validated, but reliable opaque-only exact recall is **not**. Roll out experimentally, preserve a rollback path, and keep ordinary Pi text-summary compaction available. This fork does not enable custom providers unless explicitly configured.
+
+The remaining sections record **upstream** validation, not new live results for this fork.
+
+## Upstream Responses compaction v2 validation
 
 The full live Pi RPC suite passes with both:
 
